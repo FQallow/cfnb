@@ -19,6 +19,7 @@ import json
 import asyncio
 import aiohttp
 import ipaddress
+import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
@@ -29,23 +30,17 @@ if sys.platform == 'win32':
 
 # 禁用 SSL 警告 (用于 HTTP 检测)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-# ===== 全局禁用 SSL 验证（解决证书问题）=====
-import functools
-original_get = requests.get
-original_post = requests.post
+# ===== 全局禁用 SSL 验证（所有 requests 方法 + Session 实例）=====
+_original_session_request = requests.Session.request
 
-def new_get(url, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    return original_get(url, *args, **kwargs)
+def _new_session_request(self, method, url, *args, **kwargs):
+    kwargs.setdefault("verify", False)
+    return _original_session_request(self, method, url, *args, **kwargs)
 
-def new_post(url, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    return original_post(url, *args, **kwargs)
-
-requests.get = new_get
-requests.post = new_post
-# ===========================================
+requests.Session.request = _new_session_request
+# ================================================================
 
 # ==================== 预编译正则 ====================
 NODE_PATTERN = re.compile(r"^(\d+\.\d+\.\d+\.\d+):(\d+)#(.+)$")
@@ -199,7 +194,7 @@ def load_config():
         "SOCKET_DEFAULT_TIMEOUT": 3,
         "PROGRESS_PRINT_INTERVAL": 1,
         "FILTER_COUNTRIES_ENABLED": False,
-        "ALLOWED_COUNTRIES": ["US"],
+        "ALLOWED_COUNTRIES": ["HK"],
         "PRE_FILTER_BLOCKED_ENABLED": True,
         "PRE_FILTER_BLOCKED_COUNTRIES": ["CN"],
         "PRE_FILTER_PORT_ENABLED": True,
@@ -263,6 +258,8 @@ def load_config():
         "HTTP_LATENCY_WEIGHT": 3.0,
         "JITTER_WEIGHT": 3.0,
         "HTTP_JITTER_SAMPLES": 3,
+        "OUTPUT_FILTER_COUNTRIES_ENABLED": False,
+        "OUTPUT_ALLOWED_COUNTRIES": ["HK"],
         "FILTER_IPV6_AVAILABILITY": True,
         "FILTER_BLOCKED_COUNTRIES_ENABLED": True,
         "BLOCKED_COUNTRIES": [
@@ -389,6 +386,8 @@ HTTP_TEST_METHOD = cfg["HTTP_TEST_METHOD"]
 HTTP_LATENCY_WEIGHT = cfg["HTTP_LATENCY_WEIGHT"]
 JITTER_WEIGHT = cfg["JITTER_WEIGHT"]
 HTTP_JITTER_SAMPLES = cfg["HTTP_JITTER_SAMPLES"]
+OUTPUT_FILTER_COUNTRIES_ENABLED = cfg["OUTPUT_FILTER_COUNTRIES_ENABLED"]
+OUTPUT_ALLOWED_COUNTRIES = cfg["OUTPUT_ALLOWED_COUNTRIES"]
 FILTER_IPV6_AVAILABILITY = cfg["FILTER_IPV6_AVAILABILITY"]
 FILTER_BLOCKED_COUNTRIES_ENABLED = cfg["FILTER_BLOCKED_COUNTRIES_ENABLED"]
 BLOCKED_COUNTRIES = cfg["BLOCKED_COUNTRIES"]
@@ -520,7 +519,7 @@ RISK_LEVEL_ORDER = {
 
 def get_ip_risk_level(ip):
     """查询单个 IP 的风险等级字符串，失败返回 '未知'"""
-    url = f"https://api.ipapi.is/?q={ip}"
+    url = f"https://api.090227.xyz/api/ipapi?ip={ip}"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
@@ -740,7 +739,7 @@ def fetch_additional_source(url):
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
         try:
             print(f"正在请求数据源 {url} (尝试 {attempt}/{FETCH_MAX_RETRIES}) ...")
-            headers = {"Accept-Encoding": "gzip, deflate, br, zstd"}
+            headers = {"Accept-Encoding": "gzip, deflate, br"}
             resp = requests.get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_TIMEOUT), headers=headers)
             resp.raise_for_status()
             nodes = parse_adaptive(resp.text)
@@ -773,7 +772,10 @@ class IpInfoAsync:
         self.rate_locks = [asyncio.Lock() for _ in range(self.n_tokens)]
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession(trust_env=self.trust_env)
+        self.session = aiohttp.ClientSession(
+            trust_env=self.trust_env,
+            connector=aiohttp.TCPConnector(ssl=False)
+        )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -898,7 +900,10 @@ def sort_cache_file(cache_file):
 async def validate_tokens(token_list, concurrency, min_interval, trust_env):
     valid = []
     sem = asyncio.Semaphore(concurrency)
-    async with aiohttp.ClientSession(trust_env=trust_env) as session:
+    async with aiohttp.ClientSession(
+        trust_env=trust_env,
+        connector=aiohttp.TCPConnector(ssl=False)
+    ) as session:
         async def check(token):
             url = f"https://ipinfo.io/json?token={token}"
             try:
@@ -1127,7 +1132,10 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
     ip, port = m.group(1), m.group(2)
     url = f"http://{ip}:{port}/cdn-cgi/trace"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
     }
 
     test_rounds = max(3, HTTP_JITTER_SAMPLES)
@@ -1137,7 +1145,6 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
             start = time.time()
             request_kwargs = {
                 "timeout": (connect_timeout, timeout),
-                "verify": False,
                 "allow_redirects": False,
                 "headers": headers,
                 "proxies": {"http": None, "https": None}
@@ -1316,13 +1323,16 @@ def measure_bandwidth_curl(node_str):
         "curl", "-s", "-o", null_device,
         "-w", "%{size_download} %{time_starttransfer} %{time_total}",
         "-L",
-        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+        "-H", "Accept: */*",
+        "-H", "Accept-Language: zh-CN,zh;q=0.9",
+        "-H", "Accept-Encoding: identity",
         "--http2",
         "--noproxy", "*",
         "--resolve", f"speed.cloudflare.com:{port}:{ip}",
         "--connect-timeout", str(BANDWIDTH_CONNECT_TIMEOUT),
         "--max-time", str(BANDWIDTH_TIMEOUT),
-    ] + insecure_flag + [url]   # 动态添加 --insecure（如果是 https）
+    ] + insecure_flag + [url]
 
     try:
         result = subprocess.run(curl_cmd, capture_output=True, text=True,
@@ -1738,6 +1748,8 @@ def main():
     print(f"带宽测速候选数：{BANDWIDTH_CANDIDATES}，测速文件大小：{BANDWIDTH_SIZE_MB} MB，超时：{BANDWIDTH_TIMEOUT}s")
     if FILTER_COUNTRIES_ENABLED:
         print(f"前置白名单过滤：启用，仅保留：{', '.join(ALLOWED_COUNTRIES)}")
+    if OUTPUT_FILTER_COUNTRIES_ENABLED:
+        print(f"输出白名单过滤：启用，仅保留：{', '.join(OUTPUT_ALLOWED_COUNTRIES)}")
 
     nodes = []
     for source in ADDITIONAL_SOURCES:
@@ -1869,6 +1881,31 @@ def main():
             summary="带宽测速全部失败"
         )
         speed_map = {}
+
+        # ===== 输出白名单过滤（降级分支同样生效） =====
+        if OUTPUT_FILTER_COUNTRIES_ENABLED and OUTPUT_ALLOWED_COUNTRIES:
+            allowed_set = {c.upper() for c in OUTPUT_ALLOWED_COUNTRIES}
+            before = len(results)
+            filtered_results = [
+                r for r in results
+                if '#' in r[0] and r[0].split('#')[-1].split()[0].upper() in allowed_set
+            ]
+            after = len(filtered_results)
+            if filtered_results:
+                results = filtered_results
+                if not USE_GLOBAL_MODE:
+                    country_nodes = defaultdict(list)
+                    for node_str, lat, country, succ in results:
+                        country_nodes[country].append((node_str, lat, succ))
+                print(f"\n输出白名单过滤：{before} -> {after} 个 TCP 节点（仅保留：{', '.join(sorted(allowed_set))}）")
+            else:
+                print(f"\n输出白名单过滤后仍无有效结果，将使用未过滤的 {before} 个节点作为最终节点。")
+                send_wxpusher_notification(
+                    content=f"ip.txt 输出白名单过滤后仍无有效结果（允许国家：{', '.join(sorted(allowed_set))}），已降级使用未过滤的 {before} 个节点写入 ip.txt。",
+                    summary="ip.txt 白名单过滤全部失败"
+                )
+        # =================================================
+
         if USE_GLOBAL_MODE:
             final_selected = [node for node, _, _, _ in results[:GLOBAL_TOP_N]]
         else:
@@ -1891,6 +1928,26 @@ def main():
             scored_nodes.append((node, score, speed, tcp_lat, http_lat))
 
         scored_nodes.sort(key=lambda x: x[1], reverse=True)
+
+        # ===== 输出白名单过滤（仅影响 ip.txt，不影响 DNS 更新） =====
+        if OUTPUT_FILTER_COUNTRIES_ENABLED and OUTPUT_ALLOWED_COUNTRIES:
+            allowed_set = {c.upper() for c in OUTPUT_ALLOWED_COUNTRIES}
+            before = len(scored_nodes)
+            filtered_scored = [
+                it for it in scored_nodes
+                if '#' in it[0] and it[0].split('#')[-1].split()[0].upper() in allowed_set
+            ]
+            after = len(filtered_scored)
+            if filtered_scored:
+                scored_nodes = filtered_scored
+                print(f"\n输出白名单过滤：{before} -> {after} 个测速节点（仅保留：{', '.join(sorted(allowed_set))}）")
+            else:
+                print(f"\n输出白名单过滤后仍无有效结果，将使用未过滤的 {before} 个节点作为最终节点。")
+                send_wxpusher_notification(
+                    content=f"ip.txt 输出白名单过滤后仍无有效结果（允许国家：{', '.join(sorted(allowed_set))}），已降级使用未过滤的 {before} 个节点写入 ip.txt。",
+                    summary="ip.txt 白名单过滤全部失败"
+                )
+        # ================================================================
 
         if USE_GLOBAL_MODE:
             final_selected = [item[0] for item in scored_nodes[:GLOBAL_TOP_N]]
